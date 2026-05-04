@@ -465,7 +465,7 @@ Factory::GenerateHttpUrl(const std::string &s3_url, std::string &https_url, std:
         https_url = "https://" + bucket + "." + m_region + "." + endpoint + (obj_result ? "" : ("/" + obj));
         return true;
     } else if (m_url_style == "path") {
-        if (m_region.empty()) {
+        if (!m_region.empty()) {
             https_url = "https://" + m_region + "." + endpoint + "/" + bucket + (obj_result ? "" : ("/" + obj));
         } else {
             https_url = "https://" + endpoint + "/" + bucket + (obj_result ? "" : ("/" + obj));
