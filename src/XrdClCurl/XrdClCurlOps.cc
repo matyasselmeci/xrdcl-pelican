@@ -323,6 +323,13 @@ CurlOperation::HeaderCallback(char *buffer, size_t size, size_t nitems, void *th
     if (!me->m_received_header) {
         me->m_received_header = true;
         me->m_header_start = now;
+        // Signal the TagScheduler (if any) that this op has left
+        // the "starving" bucket — the origin has committed to a
+        // response.  The hook itself uses an atomic guard so
+        // spurious re-entry is safe.
+        if (me->m_on_first_byte) {
+            me->m_on_first_byte();
+        }
     }
     me->m_header_lastop = now;
     auto rv = me->Header(header);

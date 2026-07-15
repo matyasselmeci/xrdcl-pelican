@@ -164,10 +164,31 @@ private:
  * The fact that it's poll'able is necessary because the
  * multi-curl driver thread is based on polling FD's
  */
+class TagScheduler; // Forward decl; defined in XrdClCurlTagScheduler.hh.
+
 class HandlerQueue {
 public:
     HandlerQueue(unsigned max_pending_ops);
 
+    // Optional: install a TagScheduler that takes over admission and
+    // dispatch decisions. Once set, Produce() calls scheduler->Admit()
+    // (which may reject with a "too many requests" error), and
+    // Consume()/TryConsume() delegate to the scheduler's dispatch
+    // logic instead of the FIFO. Setting to nullptr restores the
+    // built-in FIFO behavior. This method is NOT thread-safe with
+    // concurrent Produce/Consume; call it during factory setup.
+    void SetScheduler(TagScheduler *sched) { m_scheduler = sched; }
+
+    // Attempts to enqueue `handler`. Returns true on accept, false
+    // when a scheduler is configured and its per-tag or per-queue
+    // cap rejected the operation. When no scheduler is configured
+    // this always returns true (the historical Produce contract).
+    bool TryProduce(std::shared_ptr<CurlOperation> handler);
+
+    // Historical Produce: enqueue and block until room is available.
+    // Kept for backward compatibility with callers that don't yet
+    // handle a "too busy" rejection; when a scheduler is configured
+    // this calls TryProduce() and silently drops on false.
     void Produce(std::shared_ptr<CurlOperation> handler);
 
     std::shared_ptr<CurlOperation> Consume(std::chrono::steady_clock::duration);
@@ -210,6 +231,10 @@ private:
     const unsigned m_max_pending_ops{50};
     int m_read_fd{-1};
     int m_write_fd{-1};
+    // Optional per-tag scheduler. When non-null, Produce/Consume
+    // delegate to it; when null, the built-in FIFO is used.
+    // Ownership lies with Factory; the queue does not free it.
+    TagScheduler *m_scheduler{nullptr};
 };
 
 }

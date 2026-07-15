@@ -255,6 +255,7 @@ if( BUILD_XRDCL_CURL )
     src/XrdClCurl/XrdClCurlOpStat.cc
     src/XrdClCurl/XrdClCurlOps.cc          src/XrdClCurl/XrdClCurlOps.hh
     src/XrdClCurl/XrdClCurlOptionsCache.cc src/XrdClCurl/XrdClCurlOptionsCache.hh
+    src/XrdClCurl/XrdClCurlTagScheduler.cc src/XrdClCurl/XrdClCurlTagScheduler.hh
     src/XrdClCurl/XrdClCurlUtil.cc         src/XrdClCurl/XrdClCurlUtil.hh
   )
   # Makes the generated XrdClCurlVersion.hh in the include path
