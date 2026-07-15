@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <sstream>
 
 using XrdClCurl::TagScheduler;
@@ -78,6 +79,8 @@ bool TagScheduler::Admit(std::string tag, std::shared_ptr<CurlOperation> op)
     }
     if (m_cfg.pending_buffer_size > 0 && m_total_pending >= m_cfg.pending_buffer_size) {
         ++m_rejects;
+        ++m_rejects_global;
+        ++m_tags[tag].rejects;
         if (m_logger) {
             m_logger->Debug(kLogXrdClCurl,
                 "TagScheduler: rejecting admit for tag '%s' — global pending %d reached cap %d",
@@ -89,6 +92,8 @@ bool TagScheduler::Admit(std::string tag, std::shared_ptr<CurlOperation> op)
     if (m_cfg.per_tag_pending_size > 0 &&
         static_cast<int>(state.pending.size()) >= m_cfg.per_tag_pending_size) {
         ++m_rejects;
+        ++m_rejects_per_tag;
+        ++state.rejects;
         if (m_logger) {
             m_logger->Debug(kLogXrdClCurl,
                 "TagScheduler: rejecting admit for tag '%s' — per-tag pending %zu reached cap %d",
@@ -117,6 +122,7 @@ bool TagScheduler::Admit(std::string tag, std::shared_ptr<CurlOperation> op)
     state.pending.emplace_back(std::move(op));
     ++m_total_pending;
     ++m_admits;
+    ++state.admits;
     m_cv.notify_one();
     return true;
 }
@@ -276,6 +282,35 @@ void TagScheduler::Shutdown()
     m_cv.notify_all();
 }
 
+// Escape a tag key for JSON string context. Origins are hostnames, so
+// this only needs to guard against the handful of characters that
+// break JSON parsing; we do not attempt full unicode escaping.
+static void AppendJsonString(std::ostringstream &os, const std::string &s)
+{
+    os << '"';
+    for (char c : s) {
+        switch (c) {
+            case '"':  os << "\\\""; break;
+            case '\\': os << "\\\\"; break;
+            case '\b': os << "\\b";  break;
+            case '\f': os << "\\f";  break;
+            case '\n': os << "\\n";  break;
+            case '\r': os << "\\r";  break;
+            case '\t': os << "\\t";  break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20) {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "\\u%04x",
+                                  static_cast<unsigned int>(static_cast<unsigned char>(c)));
+                    os << buf;
+                } else {
+                    os << c;
+                }
+        }
+    }
+    os << '"';
+}
+
 std::string TagScheduler::GetMonitoringJson() const
 {
     std::unique_lock<std::mutex> lock(m_mu);
@@ -285,9 +320,34 @@ std::string TagScheduler::GetMonitoringJson() const
        << ",\"tags\":" << m_tags.size()
        << ",\"admits\":" << m_admits
        << ",\"rejects\":" << m_rejects
+       << ",\"rejects_global\":" << m_rejects_global
+       << ",\"rejects_per_tag\":" << m_rejects_per_tag
        << ",\"starving_cap\":" << m_starving_cap
-       << ",\"active_cap\":" << m_active_cap
-       << "}";
+       << ",\"active_cap\":" << m_active_cap;
+    // Per-tag detail: emit an array of {origin, pending, active,
+    // starving, ema, admits, rejects} objects, one per tracked
+    // origin. This is what operators grep to see WHICH origin
+    // drove the 429s.
+    os << ",\"per_tag\":[";
+    bool first = true;
+    for (const auto &entry : m_tags) {
+        if (!first) os << ",";
+        first = false;
+        const auto &st = entry.second;
+        double ema = 0.0;
+        auto ema_it = m_ema_snapshot.find(entry.first);
+        if (ema_it != m_ema_snapshot.end()) ema = ema_it->second;
+        os << "{\"origin\":";
+        AppendJsonString(os, entry.first);
+        os << ",\"pending\":" << st.pending.size()
+           << ",\"active\":" << st.active
+           << ",\"starving\":" << st.starving
+           << ",\"ema\":" << ema
+           << ",\"admits\":" << st.admits
+           << ",\"rejects\":" << st.rejects
+           << "}";
+    }
+    os << "]}";
     return os.str();
 }
 

@@ -147,6 +147,11 @@ private:
         // In-flight totals. `starving` <= `active` always.
         int active   = 0;
         int starving = 0;
+        // Monotonic per-tag lifetime counters — exposed via
+        // GetMonitoringJson for operator visibility into which
+        // origin drove the 429s.
+        std::uint64_t admits  = 0;
+        std::uint64_t rejects = 0;
     };
 
     using EmaMap = std::unordered_map<std::string, double>;
@@ -171,8 +176,10 @@ private:
     // called at most once per dispatch, not per byte.
     std::mt19937_64 m_rng;
     // Rejection / admission stats for GetMonitoringJson.
-    std::uint64_t m_admits   = 0;
-    std::uint64_t m_rejects  = 0;
+    std::uint64_t m_admits          = 0;
+    std::uint64_t m_rejects         = 0;
+    std::uint64_t m_rejects_global  = 0; // subset: global pending full
+    std::uint64_t m_rejects_per_tag = 0; // subset: per-tag FIFO full
 
     // Per-tag active-worker EMA; updated by OnMonitorTick and read
     // by PickTag_locked. Refreshed every monitor tick.
