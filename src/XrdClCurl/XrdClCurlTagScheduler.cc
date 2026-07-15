@@ -73,6 +73,15 @@ bool TagScheduler::Admit(std::string tag, std::shared_ptr<CurlOperation> op)
     if (!op) {
         return false;
     }
+    // Reason for a rejection, captured under the lock and reported to
+    // the logger after we release it. Logging is I/O and can call
+    // arbitrary sinks; we don't want it inside the scheduler's hot
+    // path critical section.
+    enum class RejectReason { Accepted, GlobalFull, PerTagFull };
+    RejectReason reject_reason = RejectReason::Accepted;
+    int total_pending_at_reject = 0;
+    size_t per_tag_pending_at_reject = 0;
+
     std::unique_lock<std::mutex> lock(m_mu);
     if (m_shutdown) {
         return false;
@@ -81,10 +90,13 @@ bool TagScheduler::Admit(std::string tag, std::shared_ptr<CurlOperation> op)
         ++m_rejects;
         ++m_rejects_global;
         ++m_tags[tag].rejects;
+        reject_reason = RejectReason::GlobalFull;
+        total_pending_at_reject = m_total_pending;
+        lock.unlock();
         if (m_logger) {
             m_logger->Debug(kLogXrdClCurl,
                 "TagScheduler: rejecting admit for tag '%s' — global pending %d reached cap %d",
-                tag.c_str(), m_total_pending, m_cfg.pending_buffer_size);
+                tag.c_str(), total_pending_at_reject, m_cfg.pending_buffer_size);
         }
         return false;
     }
@@ -94,13 +106,17 @@ bool TagScheduler::Admit(std::string tag, std::shared_ptr<CurlOperation> op)
         ++m_rejects;
         ++m_rejects_per_tag;
         ++state.rejects;
+        reject_reason = RejectReason::PerTagFull;
+        per_tag_pending_at_reject = state.pending.size();
+        lock.unlock();
         if (m_logger) {
             m_logger->Debug(kLogXrdClCurl,
                 "TagScheduler: rejecting admit for tag '%s' — per-tag pending %zu reached cap %d",
-                tag.c_str(), state.pending.size(), m_cfg.per_tag_pending_size);
+                tag.c_str(), per_tag_pending_at_reject, m_cfg.per_tag_pending_size);
         }
         return false;
     }
+    (void)reject_reason; // Reserved for future use if we ever fall through.
 
     // Install hooks BEFORE enqueue so a Consume racing on this
     // thread cannot pull the op out and start work before the hooks

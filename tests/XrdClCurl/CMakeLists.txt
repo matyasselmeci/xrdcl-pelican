@@ -37,6 +37,7 @@ add_executable( xrdcl-curl-unit
   ErrnoConvertTest.cc
   ErrorMessageTest.cc
   RedirectTest.cc
+  TagSchedulerTest.cc
 )
 
 target_link_libraries( xrdcl-test XrdClCurlTransferTest nlohmann_json::nlohmann_json GTest::gtest_main )

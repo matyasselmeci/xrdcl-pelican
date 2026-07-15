@@ -40,6 +40,7 @@
 
 #include <fcntl.h>
 #include <fstream>
+#include <string_view>
 #ifdef __APPLE__
 #include <pthread.h>
 #else
@@ -840,24 +841,52 @@ HandlerQueue::Expire()
     }
 }
 
-void
 // Derive the TagScheduler tag for a CurlOperation. v1 uses the URL
 // host; when we compose additional identifiers (user, path prefix)
 // later this is the single place to change.
-static std::string SchedulerTagFor(const CurlOperation &op)
+//
+// Returns a std::string_view into `op`'s URL — callers that need
+// owning std::string should copy explicitly.  Correctly skips both
+// userinfo (`user@host` or `user:pass@host`) and port (`host:port`),
+// including IPv6 literal bracketed hosts (`[::1]:port`).
+static std::string_view SchedulerTagFor(const CurlOperation &op)
 {
-    const std::string &url = op.GetUrl();
-    // Bare-minimum host extraction: skip past scheme://, take up to
-    // next '/', ':', or end. We do not need to be precise about port
-    // and userinfo; any consistent projection of "same origin"
-    // suffices.
-    auto scheme_end = url.find("://");
-    size_t start = scheme_end == std::string::npos ? 0 : scheme_end + 3;
+    std::string_view url = op.GetUrl();
+
+    // Skip past the scheme.  If the URL is scheme-less we treat the
+    // whole thing as the authority, which is defensible because we
+    // just want a stable per-origin bucket.
+    size_t start = 0;
+    if (auto scheme_end = url.find("://"); scheme_end != std::string_view::npos) {
+        start = scheme_end + 3;
+    }
+
+    // Authority ends at the first `/`, `?`, or `#` — or end of string.
     size_t end = url.find_first_of("/?#", start);
-    if (end == std::string::npos) end = url.size();
-    // Trim optional :port suffix.
-    auto colon = url.find(':', start);
-    if (colon != std::string::npos && colon < end) end = colon;
+    if (end == std::string_view::npos) end = url.size();
+
+    // Strip userinfo: RFC 3986 puts it before an `@` inside the
+    // authority.  Use rfind so a stray `@` inside userinfo (unusual
+    // but permitted percent-encoded) doesn't cause a mis-parse.
+    if (auto at = url.rfind('@', end == 0 ? 0 : end - 1);
+        at != std::string_view::npos && at >= start && at < end) {
+        start = at + 1;
+    }
+
+    // Strip :port.  For IPv6 literals the port colon lives after the
+    // closing bracket, so anchor the search past `]` when present.
+    size_t port_search_start = start;
+    if (start < end && url[start] == '[') {
+        auto rbracket = url.find(']', start);
+        if (rbracket != std::string_view::npos && rbracket < end) {
+            port_search_start = rbracket + 1;
+        }
+    }
+    if (auto colon = url.find(':', port_search_start);
+        colon != std::string_view::npos && colon < end) {
+        end = colon;
+    }
+
     return url.substr(start, end - start);
 }
 
@@ -899,7 +928,10 @@ HandlerQueue::TryProduce(std::shared_ptr<CurlOperation> handler)
         // Delegate admission to the scheduler. It owns the FIFO and
         // caps; we still notify the pipe on accept so the multi-curl
         // worker wakes up.
-        std::string tag = SchedulerTagFor(*handler);
+        // SchedulerTagFor returns a string_view into the op's URL;
+        // copy into std::string only at the call to Admit so the
+        // parsing above is allocation-free.
+        std::string tag{SchedulerTagFor(*handler)};
         bool accepted = m_scheduler->Admit(std::move(tag), std::move(handler));
         if (!accepted) {
             m_ops_rejected.fetch_add(1, std::memory_order_relaxed);
