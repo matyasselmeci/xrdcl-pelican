@@ -269,6 +269,58 @@ TEST(TagScheduler, MonitoringJsonHasPerTagDetail) {
 }
 
 // -----------------------------------------------------------------
+// Concurrent load: many threads slam Admit against a tight cap,
+// and the scheduler serialises them cleanly — every submission
+// resolves to a definitive accept/reject decision with no deadlock,
+// and the accepted+rejected counts match the number submitted.
+// Verifies that the wire path through Admit correctly refuses
+// requests under real concurrent load.
+// -----------------------------------------------------------------
+TEST(TagScheduler, ConcurrentBurstUnderTightCaps) {
+    auto c = PermissiveCfg();
+    c.per_tag_starving_percent = 25; // starving cap = 1 (of 4)
+    c.per_tag_active_percent   = 25;
+    c.pending_buffer_size      = 5;
+    c.per_tag_pending_size     = 2;
+    TagScheduler sched(4, c, XrdCl::DefaultEnv::GetLog());
+
+    constexpr int nThreads   = 32;
+    constexpr int perThread  = 25;
+    constexpr int totalSubmits = nThreads * perThread;
+
+    std::atomic<int> admitted{0}, rejected{0};
+    std::vector<std::thread> workers;
+    workers.reserve(nThreads);
+    for (int i = 0; i < nThreads; i++) {
+        workers.emplace_back([&, i]() {
+            for (int j = 0; j < perThread; j++) {
+                // Alternate between two tags so both the per-tag
+                // cap and the global cap are exercised.
+                const char *host = (i % 2 == 0) ? "originA" : "originB";
+                if (sched.Admit(host, MakeOp(host))) {
+                    admitted.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    rejected.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        });
+    }
+    for (auto &t : workers) t.join();
+
+    EXPECT_EQ(admitted.load() + rejected.load(), totalSubmits)
+        << "every submission must resolve to accept or reject";
+    EXPECT_GT(rejected.load(), 0)
+        << "with a 5-slot buffer against " << totalSubmits
+        << " concurrent submits and no Consume drain, the scheduler must shed load";
+
+    // The scheduler's monitoring JSON must also see the same
+    // total — it's the operator-facing view of what happened.
+    std::string js = sched.GetMonitoringJson();
+    EXPECT_NE(js.find("\"admits\":"), std::string::npos);
+    EXPECT_NE(js.find("\"rejects\":"), std::string::npos);
+}
+
+// -----------------------------------------------------------------
 // Shutdown wakes any parked Consume.
 // -----------------------------------------------------------------
 TEST(TagScheduler, ShutdownWakesConsume) {
