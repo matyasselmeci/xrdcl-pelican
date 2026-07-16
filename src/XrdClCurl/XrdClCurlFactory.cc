@@ -142,6 +142,24 @@ Factory::Initialize()
             m_log->Debug(kLogXrdClCurl, "Using %d threads for curl operations", num_threads);
         }
 
+        // The maximum number of in-flight curl operations per worker
+        // thread.  We read this BEFORE the fair-scheduler configuration
+        // because the scheduler sizes its per-tag caps as percentages of
+        // (num_threads * max_ops_per_worker); the compile-time default
+        // is 50 which is far larger than most test setups want.
+        env->PutInt("CurlMaxOpsPerWorker", XrdClCurl::CurlWorker::m_default_max_ops);
+        env->ImportInt("CurlMaxOpsPerWorker", "XRD_CURLMAXOPSPERWORKER");
+        int max_ops_per_worker = XrdClCurl::CurlWorker::m_default_max_ops;
+        if (env->GetInt("CurlMaxOpsPerWorker", max_ops_per_worker)) {
+            if (max_ops_per_worker <= 0 || max_ops_per_worker > 10'000) {
+                m_log->Error(kLogXrdClCurl, "Invalid value for the maximum number of in-flight ops per worker (%d); using default value of %d", max_ops_per_worker, XrdClCurl::CurlWorker::m_default_max_ops);
+                max_ops_per_worker = XrdClCurl::CurlWorker::m_default_max_ops;
+                env->PutInt("CurlMaxOpsPerWorker", max_ops_per_worker);
+            }
+            m_log->Debug(kLogXrdClCurl, "Using %d in-flight ops per worker", max_ops_per_worker);
+        }
+        XrdClCurl::CurlWorker::SetMaxOps(max_ops_per_worker);
+
         // Per-tag fair-scheduler configuration.  Setting
         // CurlPendingBuffer to 0 disables the scheduler entirely
         // (the queue reverts to its historical FIFO behaviour).
@@ -170,7 +188,7 @@ Factory::Initialize()
             sched_cfg.per_tag_pending_size     = sched_per_origin;
             sched_cfg.ema_window               = std::chrono::seconds(sched_ema);
             unsigned pool_size = static_cast<unsigned>(num_threads)
-                * static_cast<unsigned>(XrdClCurl::CurlWorker::m_default_max_ops);
+                * static_cast<unsigned>(max_ops_per_worker);
             m_scheduler.reset(new XrdClCurl::TagScheduler(pool_size, sched_cfg, m_log));
             m_queue->SetScheduler(m_scheduler.get());
             m_log->Debug(kLogXrdClCurl,
@@ -182,20 +200,6 @@ Factory::Initialize()
             m_log->Debug(kLogXrdClCurl,
                 "CurlPendingBuffer==0; TagScheduler disabled, using historical FIFO");
         }
-
-        // The maximum number of in-flight curl operations per worker thread.
-        env->PutInt("CurlMaxOpsPerWorker", XrdClCurl::CurlWorker::m_default_max_ops);
-        env->ImportInt("CurlMaxOpsPerWorker", "XRD_CURLMAXOPSPERWORKER");
-        int max_ops_per_worker = XrdClCurl::CurlWorker::m_default_max_ops;
-        if (env->GetInt("CurlMaxOpsPerWorker", max_ops_per_worker)) {
-            if (max_ops_per_worker <= 0 || max_ops_per_worker > 10'000) {
-                m_log->Error(kLogXrdClCurl, "Invalid value for the maximum number of in-flight ops per worker (%d); using default value of %d", max_ops_per_worker, XrdClCurl::CurlWorker::m_default_max_ops);
-                max_ops_per_worker = XrdClCurl::CurlWorker::m_default_max_ops;
-                env->PutInt("CurlMaxOpsPerWorker", max_ops_per_worker);
-            }
-            m_log->Debug(kLogXrdClCurl, "Using %d in-flight ops per worker", max_ops_per_worker);
-        }
-        XrdClCurl::CurlWorker::SetMaxOps(max_ops_per_worker);
 
         // The stall timeout to use for transfer operations.
         env->PutInt("CurlStallTimeout", XrdClCurl::CurlOperation::GetDefaultStallTimeout());
