@@ -141,30 +141,6 @@ RUNDIR="$BINARY_DIR/tests/$TEST_NAME"
 echo "Using $RUNDIR as the test run's home directory."
 cd "$RUNDIR" || exit 1
 
-# Pick an ephemeral origin port up front. The origin's TLS host name,
-# scitokens issuer/audience, openid-configuration, and cache pss.origin
-# all need to agree on this port, and the scitokens plugin loads its
-# config at origin startup (so we can't defer the port until after we
-# use "xrd.port any" and parse the log). Ask the kernel for a free
-# port, then release it; the origin will bind it a moment later.
-# There's a benign race between release and bind, harmless in practice
-# on a lightly-loaded test box.
-if command -v python3 >/dev/null 2>&1; then
-  ORIGIN_PORT=$(python3 -c 'import socket
-s = socket.socket()
-s.bind(("", 0))
-print(s.getsockname()[1])
-s.close()')
-else
-  echo "python3 is required to allocate a free port for the origin" >&2
-  exit 1
-fi
-if [ -z "$ORIGIN_PORT" ]; then
-  echo "Failed to allocate a free port for the origin" >&2
-  exit 1
-fi
-echo "Origin will listen on ephemeral port $ORIGIN_PORT"
-
 XROOTD_EXPORTDIR="$RUNDIR/export"
 rm -rf "$XROOTD_EXPORTDIR"
 mkdir -p "$XROOTD_EXPORTDIR/test" || exit 1
@@ -172,12 +148,7 @@ XROOTD_PUBLIC_EXPORTDIR="$XROOTD_EXPORTDIR/test-public"
 mkdir -p "$XROOTD_PUBLIC_EXPORTDIR" || exit 1
 
 mkdir -p "$XROOTD_EXPORTDIR"/.well-known || exit 1
-# Substitute the origin's ephemeral port into openid-configuration so
-# a token consumer that follows the OIDC discovery chain lands on the
-# right port for the JWKS URL.
-sed "s|https://localhost:8443|https://localhost:$ORIGIN_PORT|g" \
-  "$SOURCE_DIR/tests/XrdClCurl/openid-configuration" \
-  > "$XROOTD_EXPORTDIR/.well-known/openid-configuration" || exit 1
+cp "$SOURCE_DIR/tests/XrdClCurl/openid-configuration" "$XROOTD_EXPORTDIR/.well-known/openid-configuration" || exit 1
 
 if ! "$OPENSSL_BIN" ecparam -name prime256v1 -genkey -noout -out "issuer_private.pem"; then
   echo "Failed to generate EC private key"
@@ -233,8 +204,8 @@ mkdir -p "$XROOTD_CONFIGDIR"
 export ORIGIN_CONFIG="$XROOTD_CONFIGDIR/xrootd-origin.conf"
 cat > "$ORIGIN_CONFIG" <<EOF
 
-xrd.port $ORIGIN_PORT
-xrd.protocol http:$ORIGIN_PORT libXrdHttp.so
+xrd.port any
+xrd.protocol http:any libXrdHttp.so
 
 xrd.tls $CA_DIR/tls.crt $CA_DIR/tls.key
 xrd.tlsca certfile $CA_DIR/tlsca.pem
@@ -335,7 +306,7 @@ $( [ "${XRDCL_CACHE_CONTROL:-0}" = "1" ] && printf '%s\n' \
 
 xrootd.fslib ++ throttle
 
-pss.origin https://localhost:$ORIGIN_PORT
+pss.origin https://localhost:__ORIGIN_PORT__
 oss.localroot $XROOTD_CACHEDIR/namespace
 pfc.spaces data meta
 oss.space data $XROOTD_CACHEDIR/data
@@ -364,10 +335,10 @@ EOF
 cat > "$RUNDIR/scitokens.cfg" << EOF
 
 [Global]
-audience = https://localhost:$ORIGIN_PORT
+audience = https://localhost:8443
 
 [Issuer Localhost]
-issuer = https://localhost:$ORIGIN_PORT
+issuer = https://localhost:8443
 base_path = /test
 
 EOF
@@ -461,6 +432,14 @@ while [ -z "$ORIGIN_PORT" ]; do
   fi
 done
 echo "Origin started at port $ORIGIN_PORT"
+
+# Now that we know the origin's actual port, substitute it into the
+# cache config template's pss.origin line. Using a placeholder token
+# (rather than picking a port up front) sidesteps a TOCTOU race
+# where the port we pre-reserved could be grabbed by another
+# process before xrootd binds it.
+sed -i.bak "s|__ORIGIN_PORT__|$ORIGIN_PORT|g" "$CACHE_CONFIG"
+rm -f "$CACHE_CONFIG.bak"
 
 echo > "$BINARY_DIR/tests/$TEST_NAME/cache.log"
 "$BINDIR/xrootd" -n cache -c "$CACHE_CONFIG" 0<&- >"$BINARY_DIR/tests/$TEST_NAME/cache.log" 2>&1 &
@@ -572,7 +551,7 @@ echo "Tight-scheduler cache started at port $TIGHT_CACHE_PORT"
 
 if ! "$BINARY_DIR/tests/XrdClCurl/xrdscitokens-create-token" \
     issuer_public.pem issuer_private.pem test_key \
-    "https://localhost:$ORIGIN_PORT" storage.read:/ 600 > "$RUNDIR/token"; then
+    https://localhost:8443 storage.read:/ 600 > "$RUNDIR/token"; then
   echo "Failed to generate read token"
   exit 1
 fi
@@ -580,7 +559,7 @@ echo "Sample read token available at $RUNDIR/token"
 
 if ! "$BINARY_DIR/tests/XrdClCurl/xrdscitokens-create-token" \
     issuer_public.pem issuer_private.pem test_key \
-    "https://localhost:$ORIGIN_PORT" storage.modify:/ 600 > "$RUNDIR/write.token"; then
+    https://localhost:8443 storage.modify:/ 600 > "$RUNDIR/write.token"; then
   echo "Failed to generate write token"
   exit 1
 fi
