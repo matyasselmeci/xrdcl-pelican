@@ -82,17 +82,20 @@ TEST_F(SchedulerBurst, BurstShedsRequestsUnderTightCaps) {
     const std::string ca_file = GetEnv("X509_CA_FILE");
     ASSERT_FALSE(ca_file.empty());
 
-    // /test-public/slow_read.txt: fed by the slow-OSS layer (see
-    // tests/XrdClCurlCommon/XrdOssSlowOpen.cc) at ~500 KB/s from a
-    // 1 GiB "file", so an admitted transfer stays in-flight long
-    // enough for concurrent admissions to fill the scheduler's
-    // 1-slot FIFO.
+    // /test-public/slow_read_N.txt: family of independent slow files fed
+    // by the slow-OSS layer (see tests/XrdClCurlCommon/XrdOssSlowOpen.cc)
+    // at ~500 KB/s from a fake 1 GiB size each. Using distinct
+    // pathnames per client is essential: the cache's PFC coalesces
+    // concurrent requests for the same object onto a single
+    // upstream prefetch, which would hide the scheduler contention
+    // we're trying to observe. Distinct paths force N independent
+    // cache→origin fetches that all compete for the tight
+    // scheduler's single slot.
     //
     // The tight cache is configured with a permissive authdb
     // (u * /test-public lr) so we don't have to entangle this test with
     // the fixture's SciTokens setup — the property under test is
     // the scheduler's shed behaviour, not auth.
-    const std::string url = tight_cache + "/test-public/slow_read.txt";
 
     // Some hosts curl_easy_init lazily; make sure global init is
     // done before the threads fan out.
@@ -108,7 +111,10 @@ TEST_F(SchedulerBurst, BurstShedsRequestsUnderTightCaps) {
             CURL *c = curl_easy_init();
             if (!c) return;
             char err[CURL_ERROR_SIZE] = {0};
-            curl_easy_setopt(c, CURLOPT_URL, url.c_str());
+            char url_buf[512];
+            snprintf(url_buf, sizeof(url_buf),
+                     "%s/test-public/slow_read_%d.txt", tight_cache.c_str(), i);
+            curl_easy_setopt(c, CURLOPT_URL, url_buf);
             curl_easy_setopt(c, CURLOPT_CAINFO, ca_file.c_str());
             std::string body_capture;
             curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, AppendBody);
