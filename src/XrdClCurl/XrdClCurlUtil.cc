@@ -21,6 +21,7 @@
 #include "XrdClCurlFile.hh"
 #include "XrdClCurlOps.hh"
 #include "XrdClCurlOptionsCache.hh"
+#include "XrdClCurlTagScheduler.hh"
 #include "XrdClCurlUtil.hh"
 #include "XrdClCurlVersion.hh"
 #include "XrdClCurlWorker.hh"
@@ -39,6 +40,7 @@
 
 #include <fcntl.h>
 #include <fstream>
+#include <string_view>
 #ifdef __APPLE__
 #include <pthread.h>
 #else
@@ -839,9 +841,114 @@ HandlerQueue::Expire()
     }
 }
 
-void
-HandlerQueue::Produce(std::shared_ptr<CurlOperation> handler)
+// Derive the TagScheduler tag for a CurlOperation. v1 uses the URL
+// host; when we compose additional identifiers (user, path prefix)
+// later this is the single place to change.
+//
+// Returns a std::string_view into `op`'s URL — callers that need
+// owning std::string should copy explicitly.  Correctly skips both
+// userinfo (`user@host` or `user:pass@host`) and port (`host:port`),
+// including IPv6 literal bracketed hosts (`[::1]:port`).
+static std::string_view SchedulerTagFor(const CurlOperation &op)
 {
+    std::string_view url = op.GetUrl();
+
+    // Skip past the scheme.  If the URL is scheme-less we treat the
+    // whole thing as the authority, which is defensible because we
+    // just want a stable per-origin bucket.
+    size_t start = 0;
+    if (auto scheme_end = url.find("://"); scheme_end != std::string_view::npos) {
+        start = scheme_end + 3;
+    }
+
+    // Authority ends at the first `/`, `?`, or `#` — or end of string.
+    size_t end = url.find_first_of("/?#", start);
+    if (end == std::string_view::npos) end = url.size();
+
+    // Strip userinfo: RFC 3986 puts it before an `@` inside the
+    // authority.  Use rfind so a stray `@` inside userinfo (unusual
+    // but permitted percent-encoded) doesn't cause a mis-parse.
+    if (auto at = url.rfind('@', end == 0 ? 0 : end - 1);
+        at != std::string_view::npos && at >= start && at < end) {
+        start = at + 1;
+    }
+
+    // Strip :port.  For IPv6 literals the port colon lives after the
+    // closing bracket, so anchor the search past `]` when present.
+    size_t port_search_start = start;
+    if (start < end && url[start] == '[') {
+        auto rbracket = url.find(']', start);
+        if (rbracket != std::string_view::npos && rbracket < end) {
+            port_search_start = rbracket + 1;
+        }
+    }
+    if (auto colon = url.find(':', port_search_start);
+        colon != std::string_view::npos && colon < end) {
+        end = colon;
+    }
+
+    return url.substr(start, end - start);
+}
+
+// Wake the multi-curl worker via the pipe so a poll() call returns.
+// Callers hold m_mutex.
+static void NotifyPipe_locked(int write_fd)
+{
+    char ready[] = "1";
+    while (true) {
+        auto result = write(write_fd, ready, 1);
+        if (result == -1) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            throw std::runtime_error(strerror(errno));
+        }
+        break;
+    }
+}
+
+// Drain one byte from the pipe. Callers hold m_mutex.
+static void DrainPipe_locked(int read_fd)
+{
+    char buf[1];
+    while (true) {
+        auto result = read(read_fd, buf, 1);
+        if (result == -1) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            throw std::runtime_error(strerror(errno));
+        }
+        break;
+    }
+}
+
+bool
+HandlerQueue::TryProduce(std::shared_ptr<CurlOperation> handler)
+{
+    if (m_scheduler) {
+        // Delegate admission to the scheduler. It owns the FIFO and
+        // caps; we still notify the pipe on accept so the multi-curl
+        // worker wakes up.
+        // SchedulerTagFor returns a string_view into the op's URL;
+        // copy into std::string only at the call to Admit so the
+        // parsing above is allocation-free.
+        std::string tag{SchedulerTagFor(*handler)};
+        bool accepted = m_scheduler->Admit(std::move(tag), std::move(handler));
+        if (!accepted) {
+            m_ops_rejected.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        {
+            std::unique_lock<std::mutex> lk{m_mutex};
+            NotifyPipe_locked(m_write_fd);
+        }
+        m_consumer_cv.notify_one();
+        m_ops_produced.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+
+    // Non-scheduler path: enforce the queue's own m_max_pending_ops
+    // cap.  Historically this blocks the producer; if the queue is
+    // full and the operation's own expiry is reached first, fail.
     auto handler_expiry = handler->GetOperationExpiry();
     std::unique_lock<std::mutex> lk{m_mutex};
     m_producer_cv.wait_until(lk,
@@ -850,36 +957,46 @@ HandlerQueue::Produce(std::shared_ptr<CurlOperation> handler)
     );
     if (std::chrono::steady_clock::now() > handler_expiry) {
         lk.unlock();
-        handler->Fail(XrdCl::errOperationExpired, 0, "Operation expired while waiting for worker");
         m_ops_rejected.fetch_add(1, std::memory_order_relaxed);
-        return;
+        return false;
     }
 
     m_ops.push_back(handler);
-    char ready[] = "1";
-    while (true) {
-        auto result = write(m_write_fd, ready, 1);
-        if (result == -1) {
-            if (errno == EINTR) {
-                continue;
-            } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // This should never happen, but if it does, just continue
-                // as if we successfully wrote the notification to the pipe.
-                break;
-            }
-            throw std::runtime_error(strerror(errno));
-        }
-        break;
-    }
-
+    NotifyPipe_locked(m_write_fd);
     lk.unlock();
     m_consumer_cv.notify_one();
     m_ops_produced.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+void
+HandlerQueue::Produce(std::shared_ptr<CurlOperation> handler)
+{
+    // Preserves the historical Produce contract: never returns
+    // failure to the caller.  On rejection (scheduler cap or expiry
+    // during wait), fail the operation directly so callers that
+    // haven't been ported to TryProduce still see a clean error
+    // path instead of a lost request.
+    auto raw = handler.get();
+    if (!TryProduce(std::move(handler))) {
+        raw->Fail(XrdCl::errRetry, 0,
+            "Too many pending requests for this origin; try again later");
+    }
 }
 
 std::shared_ptr<CurlOperation>
 HandlerQueue::Consume(std::chrono::steady_clock::duration dur)
 {
+    if (m_scheduler) {
+        auto op = m_scheduler->Consume(dur);
+        if (op) {
+            std::unique_lock<std::mutex> lk(m_mutex);
+            DrainPipe_locked(m_read_fd);
+            m_ops_consumed.fetch_add(1, std::memory_order_relaxed);
+        }
+        return op;
+    }
+
     std::unique_lock<std::mutex> lk(m_mutex);
     m_consumer_cv.wait_for(lk, dur, [&]{return m_ops.size() > 0 || m_shutdown;});
     if (m_shutdown || m_ops.empty()) {
@@ -888,27 +1005,10 @@ HandlerQueue::Consume(std::chrono::steady_clock::duration dur)
 
     std::shared_ptr<CurlOperation> result = m_ops.front();
     m_ops.pop_front();
-
-    char ready[1];
-    while (true) {
-        auto result = read(m_read_fd, ready, 1);
-        if (result == -1) {
-            if (errno == EINTR) {
-                continue;
-            } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // This should never happen, but if it does, just continue
-                // as if we successfully read the byte.
-                break;
-            }
-            throw std::runtime_error(strerror(errno));
-        }
-        break;
-    }
-
+    DrainPipe_locked(m_read_fd);
     lk.unlock();
     m_producer_cv.notify_one();
     m_ops_consumed.fetch_add(1, std::memory_order_relaxed);
-
     return result;
 }
 
@@ -928,35 +1028,26 @@ HandlerQueue::GetMonitoringJson()
 std::shared_ptr<CurlOperation>
 HandlerQueue::TryConsume()
 {
+    if (m_scheduler) {
+        auto op = m_scheduler->TryConsume();
+        if (op) {
+            std::unique_lock<std::mutex> lk(m_mutex);
+            DrainPipe_locked(m_read_fd);
+            m_ops_consumed.fetch_add(1, std::memory_order_relaxed);
+        }
+        return op;
+    }
+
     std::unique_lock<std::mutex> lk(m_mutex);
     if (m_ops.size() == 0) {
-        std::shared_ptr<CurlOperation> result;
-        return result;
+        return {};
     }
-
     std::shared_ptr<CurlOperation> result = m_ops.front();
     m_ops.pop_front();
-
-    char ready[1];
-    while (true) {
-        auto result = read(m_read_fd, ready, 1); 
-        if (result == -1) {
-            if (errno == EINTR) {
-                continue;
-            } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // This should never happen, but if it does, just continue
-                // as if we successfully read the byte.
-                break;
-            }
-            throw std::runtime_error(strerror(errno));
-        }   
-        break;
-    }
-
+    DrainPipe_locked(m_read_fd);
     lk.unlock();
     m_producer_cv.notify_one();
     m_ops_consumed.fetch_add(1, std::memory_order_relaxed);
-
     return result;
 }
 

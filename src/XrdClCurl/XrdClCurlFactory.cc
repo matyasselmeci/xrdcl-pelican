@@ -24,6 +24,7 @@
 #include "XrdClCurlUtil.hh"
 #include "XrdClCurlOps.hh"
 #include "XrdClCurlParseTimeout.hh"
+#include "XrdClCurlTagScheduler.hh"
 #include "XrdClCurlWorker.hh"
 
 #include "XrdCl/XrdClConstants.hh"
@@ -55,6 +56,7 @@ Factory::GetHeaderTimeoutWithDefault(time_t oper_timeout)
 
 bool Factory::m_initialized = false;
 std::shared_ptr<XrdClCurl::HandlerQueue> Factory::m_queue;
+std::unique_ptr<XrdClCurl::TagScheduler> Factory::m_scheduler;
 XrdCl::Log *Factory::m_log = nullptr;
 std::once_flag Factory::m_init_once;
 std::string Factory::m_stats_location;
@@ -140,7 +142,11 @@ Factory::Initialize()
             m_log->Debug(kLogXrdClCurl, "Using %d threads for curl operations", num_threads);
         }
 
-        // The maximum number of in-flight curl operations per worker thread.
+        // The maximum number of in-flight curl operations per worker
+        // thread.  We read this BEFORE the fair-scheduler configuration
+        // because the scheduler sizes its per-tag caps as percentages of
+        // (num_threads * max_ops_per_worker); the compile-time default
+        // is 50 which is far larger than most test setups want.
         env->PutInt("CurlMaxOpsPerWorker", XrdClCurl::CurlWorker::m_default_max_ops);
         env->ImportInt("CurlMaxOpsPerWorker", "XRD_CURLMAXOPSPERWORKER");
         int max_ops_per_worker = XrdClCurl::CurlWorker::m_default_max_ops;
@@ -153,6 +159,47 @@ Factory::Initialize()
             m_log->Debug(kLogXrdClCurl, "Using %d in-flight ops per worker", max_ops_per_worker);
         }
         XrdClCurl::CurlWorker::SetMaxOps(max_ops_per_worker);
+
+        // Per-tag fair-scheduler configuration.  Setting
+        // CurlPendingBuffer to 0 disables the scheduler entirely
+        // (the queue reverts to its historical FIFO behaviour).
+        env->PutInt("CurlPendingBuffer", 200);
+        env->ImportInt("CurlPendingBuffer", "XRD_CURLPENDINGBUFFER");
+        env->PutInt("CurlPendingPerOrigin", 50);
+        env->ImportInt("CurlPendingPerOrigin", "XRD_CURLPENDINGPERORIGIN");
+        env->PutInt("CurlStarvingPercent", 25);
+        env->ImportInt("CurlStarvingPercent", "XRD_CURLSTARVINGPERCENT");
+        env->PutInt("CurlActivePercent", 90);
+        env->ImportInt("CurlActivePercent", "XRD_CURLACTIVEPERCENT");
+        env->PutInt("CurlEmaSeconds", 30);
+        env->ImportInt("CurlEmaSeconds", "XRD_CURLEMASECONDS");
+        int sched_buffer = 200, sched_per_origin = 50, sched_starving = 25,
+            sched_active = 90, sched_ema = 30;
+        env->GetInt("CurlPendingBuffer",     sched_buffer);
+        env->GetInt("CurlPendingPerOrigin",  sched_per_origin);
+        env->GetInt("CurlStarvingPercent",   sched_starving);
+        env->GetInt("CurlActivePercent",     sched_active);
+        env->GetInt("CurlEmaSeconds",        sched_ema);
+        if (sched_buffer > 0) {
+            XrdClCurl::TagScheduler::Config sched_cfg;
+            sched_cfg.per_tag_starving_percent = sched_starving;
+            sched_cfg.per_tag_active_percent   = sched_active;
+            sched_cfg.pending_buffer_size      = sched_buffer;
+            sched_cfg.per_tag_pending_size     = sched_per_origin;
+            sched_cfg.ema_window               = std::chrono::seconds(sched_ema);
+            unsigned pool_size = static_cast<unsigned>(num_threads)
+                * static_cast<unsigned>(max_ops_per_worker);
+            m_scheduler.reset(new XrdClCurl::TagScheduler(pool_size, sched_cfg, m_log));
+            m_queue->SetScheduler(m_scheduler.get());
+            m_log->Debug(kLogXrdClCurl,
+                "TagScheduler enabled: pool=%u, starving=%d%%, active=%d%%, "
+                "pending_buffer=%d, per_origin=%d, ema=%ds",
+                pool_size, sched_starving, sched_active,
+                sched_buffer, sched_per_origin, sched_ema);
+        } else {
+            m_log->Debug(kLogXrdClCurl,
+                "CurlPendingBuffer==0; TagScheduler disabled, using historical FIFO");
+        }
 
         // The stall timeout to use for transfer operations.
         env->PutInt("CurlStallTimeout", XrdClCurl::CurlOperation::GetDefaultStallTimeout());
@@ -252,12 +299,22 @@ Factory::Monitor()
 
         auto now = std::chrono::system_clock::now();
 
+        // Advance the TagScheduler's EMA snapshot on the same cadence
+        // we publish monitoring, so no separate ticker thread is
+        // needed for it.
+        if (m_scheduler) {
+            m_scheduler->OnMonitorTick();
+        }
+
         std::string monitoring = "{\"event\": \"xrdclcurl\", "
             "\"start\": " + std::to_string(std::chrono::duration<double>(m_start.time_since_epoch()).count()) + ","
             "\"now\": " + std::to_string(std::chrono::duration<double>(now.time_since_epoch()).count()) + ","
             "\"file\": " + File::GetMonitoringJson() + ","
             "\"workers\": " + CurlWorker::GetMonitoringJson() + ","
             "\"queues\": " + HandlerQueue::GetMonitoringJson() +
+            (m_scheduler
+                ? (",\"scheduler\": " + m_scheduler->GetMonitoringJson())
+                : std::string{}) +
             " }";
         m_log->Info(kLogXrdClCurl, "Client monitoring statistics: %s", monitoring.c_str());
         if (gstream) {
@@ -346,6 +403,13 @@ Factory::Shutdown()
         std::unique_lock lock(m_shutdown_lock);
         m_shutdown_requested = true;
         m_shutdown_requested_cv.notify_one();
+    }
+    // Ask the scheduler to wake any parked Consume() so workers can
+    // exit. Detach from the HandlerQueue first so no new Consume()
+    // call can re-park inside the scheduler after we've released it.
+    if (m_scheduler && m_queue) {
+        m_queue->SetScheduler(nullptr);
+        m_scheduler->Shutdown();
     }
     if (m_monitor_tid.joinable()) {
       m_monitor_tid.join();

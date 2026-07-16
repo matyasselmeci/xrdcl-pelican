@@ -32,9 +32,26 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <unistd.h>
 
 namespace {
+
+// A family of "slow" files: the original /test/slow_read.txt
+// (used by other fixtures with a bearer token) plus any path matching
+// /test-public/slow_read.txt or /test-public/slow_read_*.txt — each
+// behaves like slow_read.txt but has a distinct pathname, so the
+// cache's PFC treats them as independent objects instead of
+// coalescing requests onto one prefetch. Used by SchedulerBurstTest
+// to force N concurrent cache→origin fetches that all contend for the
+// client-side scheduler's slots.
+bool IsSlowReadPath(std::string_view p) {
+    if (p == "/test/slow_read.txt" || p == "/test-public/slow_read.txt") {
+        return true;
+    }
+    return p.rfind("/test-public/slow_read_", 0) == 0 &&
+           p.size() > 4 && p.substr(p.size() - 4) == ".txt";
+}
 
 // Counters for retry error injection.
 // The first Open/Read for the corresponding path fails; subsequent ones succeed.
@@ -69,7 +86,7 @@ class File final : public XrdOssWrapDF {
         if (m_path == "/test/slow_open.txt") {
             usleep(12'000'000); // 12s
         }
-        else if (m_path == "/test/slow_read.txt" || m_path == "/test/stall_read.txt") {
+        else if (IsSlowReadPath(m_path) || m_path == "/test/stall_read.txt") {
             return 0;
         }
         else if (m_path == "/test/retry_read.txt") {
@@ -119,7 +136,7 @@ class File final : public XrdOssWrapDF {
             std::string a_repeated = std::string(size, 'a');
             memcpy(buffer, a_repeated.data(), size);
             return size;
-        } else if (m_path == "/test/slow_read.txt") {
+        } else if (IsSlowReadPath(m_path)) {
             usleep(500'000); // 1ms
             auto xfer = 256 < size ? 256 : size;
             std::string a_repeated = std::string(xfer, 'a');
@@ -148,7 +165,7 @@ class File final : public XrdOssWrapDF {
     }
 
     virtual int Fstat(struct stat *buff) override {
-        if (buff && (m_path == "/test/slow_read.txt" || m_path == "/test/stall_read.txt")) {
+        if (buff && (IsSlowReadPath(m_path) || m_path == "/test/stall_read.txt")) {
             memset(buff, 0, sizeof(struct stat));
             buff->st_mode = S_IFREG | 0644;
             buff->st_size = 1024 * 1024 * 1024; // 1GB
@@ -191,7 +208,7 @@ class FileSystem final : public XrdOssWrapper {
         fprintf(stderr, "Got stat for path: %s\n", path);
         if (spath == "/test/slow_open.txt") {
             usleep(12'000'000); // 12s
-        } else if (buff && (spath == "/test/slow_read.txt" || spath == "/test/stall_read.txt")) {
+        } else if (buff && (IsSlowReadPath(spath) || spath == "/test/stall_read.txt")) {
             memset(buff, 0, sizeof(struct stat));
             buff->st_mode = S_IFREG | 0644;
             buff->st_size = 1024 * 1024 * 1024; // 1GB

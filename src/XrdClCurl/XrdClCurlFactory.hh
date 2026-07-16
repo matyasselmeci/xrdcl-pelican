@@ -40,6 +40,7 @@ namespace XrdClCurl {
 class CurlOperation;
 class CurlWorker;
 class HandlerQueue;
+class TagScheduler;
 
 class Factory final : public XrdCl::PlugInFactory {
 public:
@@ -71,6 +72,9 @@ private:
 
     static bool m_initialized;
     static std::shared_ptr<XrdClCurl::HandlerQueue> m_queue;
+    // Optional per-tag scheduler installed into m_queue at Init().
+    // The queue holds a raw pointer; ownership stays here.
+    static std::unique_ptr<XrdClCurl::TagScheduler> m_scheduler;
     static XrdCl::Log *m_log;
     const static unsigned m_poll_threads{8};
     static std::once_flag m_init_once;

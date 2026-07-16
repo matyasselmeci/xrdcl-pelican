@@ -30,6 +30,7 @@
 #include <XrdCl/XrdClXRootDResponses.hh>
 
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <string>
 #include <utility>
@@ -421,8 +422,31 @@ private:
     // Periodic transfer info callback function invoked by curl; used for more fine-grained timeouts.
     static int XferInfoCallback(void *clientp, curl_off_t dltotal, curl_off_t dlnow, curl_off_t ultotal, curl_off_t ulnow);
 
+public:
+    // TagScheduler hooks: nil unless the operation was admitted
+    // through a TagScheduler. m_on_first_byte fires exactly once, on
+    // the first byte of the response headers (a proxy for "the
+    // origin has committed to responding" that catches the black-holed
+    // TCP case). m_on_done fires exactly once when the operation
+    // reaches its terminal state via SetDone(). The scheduler
+    // guarantees single-shot semantics of its own hooks via a
+    // shared std::atomic<bool>; nothing in CurlOperation itself is
+    // required beyond storing and invoking these callbacks.
+    std::function<void()> m_on_first_byte;
+    std::function<void()> m_on_done;
+
 protected:
-    void SetDone(bool has_failed) {m_done = true; m_has_failed.store(has_failed, std::memory_order_release);}
+    void SetDone(bool has_failed) {
+        m_done = true;
+        m_has_failed.store(has_failed, std::memory_order_release);
+        // Fire the scheduler done hook, if any, exactly once. A
+        // dedicated flag guards against re-entry through
+        // Fail() -> ReleaseHandle() -> Fail() paths.
+        if (m_on_done && !m_done_hook_fired.exchange(true, std::memory_order_relaxed)) {
+            auto fn = std::move(m_on_done);
+            fn();
+        }
+    }
     const std::string m_url;
 
     // The most recent URL.  Initialized to `m_url` and updated by `Redirect()`
@@ -439,6 +463,12 @@ protected:
     HeaderParser m_headers;
     std::vector<std::pair<std::string, std::string>> m_headers_list;
     XrdCl::Log *m_logger;
+
+    // Guards SetDone() so the m_on_done hook fires at most once
+    // per operation even across multiple SetDone() invocations
+    // (Fail() paths can end up calling SetDone repeatedly during
+    // teardown).
+    std::atomic<bool> m_done_hook_fired{false};
 };
 
 // Query the remote service using the OPTIONS verb.
