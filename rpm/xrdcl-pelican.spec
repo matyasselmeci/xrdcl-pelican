@@ -1,6 +1,6 @@
 
 Name: xrdcl-pelican
-Version: 1.7.1
+Version: 1.8.0
 Release: 1%{?dist}
 Summary: A Pelican-specific backend for the XRootD client
 
@@ -106,6 +106,28 @@ make install DESTDIR=$RPM_BUILD_ROOT
 %endif
 
 %changelog
+* Thu Jul 16 2026 Brian Bockelman <bbockelman@morgridge.org> 1.8.0-1
+- Add a per-origin fair scheduler in front of the curl worker pool so
+  that a single unresponsive upstream origin cannot hold every worker
+  slot on stalled connections while other origins remain unserved;
+  requests exceeding the caps are shed with an errRetry error the
+  cache surfaces to the client.
+- Backport upstream XRootD fix: correct a dangling reference returned
+  from GetCallbackError() (memory safety).
+- Backport upstream XRootD fix: missing break in the CurlWorker
+  telemetry switch caused conncall-timeout events to be double-counted
+  as client-timeouts.
+- Backport upstream XRootD fix: use case-insensitive comparisons for
+  WebDAV XML tag names for compatibility with servers that emit
+  lowercase 'd:href' etc.
+- Backport upstream XRootD S3 fix: reversed if condition in path-style
+  URL generation was building the wrong URL when a region was set.
+- Backport upstream XRootD S3 change: allow the region to be set to
+  empty by defaulting m_region to "" and m_url_style to "path"; this
+  makes MinIO and other non-AWS S3 endpoints work out of the box, at
+  the cost of changing defaults for callers targeting AWS (who must
+  now set the region explicitly).
+
 * Thu Jun 18 2026 Brian Bockelman <bbockelman@morgridge.org> 1.7.1-1
 - Normalize error codes; do not pass through a libcurl error code where errno
   is expected.
