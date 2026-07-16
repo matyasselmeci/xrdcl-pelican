@@ -141,6 +141,30 @@ RUNDIR="$BINARY_DIR/tests/$TEST_NAME"
 echo "Using $RUNDIR as the test run's home directory."
 cd "$RUNDIR" || exit 1
 
+# Pick an ephemeral origin port up front. The origin's TLS host name,
+# scitokens issuer/audience, openid-configuration, and cache pss.origin
+# all need to agree on this port, and the scitokens plugin loads its
+# config at origin startup (so we can't defer the port until after we
+# use "xrd.port any" and parse the log). Ask the kernel for a free
+# port, then release it; the origin will bind it a moment later.
+# There's a benign race between release and bind, harmless in practice
+# on a lightly-loaded test box.
+if command -v python3 >/dev/null 2>&1; then
+  ORIGIN_PORT=$(python3 -c 'import socket
+s = socket.socket()
+s.bind(("", 0))
+print(s.getsockname()[1])
+s.close()')
+else
+  echo "python3 is required to allocate a free port for the origin" >&2
+  exit 1
+fi
+if [ -z "$ORIGIN_PORT" ]; then
+  echo "Failed to allocate a free port for the origin" >&2
+  exit 1
+fi
+echo "Origin will listen on ephemeral port $ORIGIN_PORT"
+
 XROOTD_EXPORTDIR="$RUNDIR/export"
 rm -rf "$XROOTD_EXPORTDIR"
 mkdir -p "$XROOTD_EXPORTDIR/test" || exit 1
@@ -148,7 +172,12 @@ XROOTD_PUBLIC_EXPORTDIR="$XROOTD_EXPORTDIR/test-public"
 mkdir -p "$XROOTD_PUBLIC_EXPORTDIR" || exit 1
 
 mkdir -p "$XROOTD_EXPORTDIR"/.well-known || exit 1
-cp "$SOURCE_DIR/tests/XrdClCurl/openid-configuration" "$XROOTD_EXPORTDIR/.well-known/openid-configuration" || exit 1
+# Substitute the origin's ephemeral port into openid-configuration so
+# a token consumer that follows the OIDC discovery chain lands on the
+# right port for the JWKS URL.
+sed "s|https://localhost:8443|https://localhost:$ORIGIN_PORT|g" \
+  "$SOURCE_DIR/tests/XrdClCurl/openid-configuration" \
+  > "$XROOTD_EXPORTDIR/.well-known/openid-configuration" || exit 1
 
 if ! "$OPENSSL_BIN" ecparam -name prime256v1 -genkey -noout -out "issuer_private.pem"; then
   echo "Failed to generate EC private key"
@@ -204,8 +233,8 @@ mkdir -p "$XROOTD_CONFIGDIR"
 export ORIGIN_CONFIG="$XROOTD_CONFIGDIR/xrootd-origin.conf"
 cat > "$ORIGIN_CONFIG" <<EOF
 
-xrd.port 8443
-xrd.protocol http:8443 libXrdHttp.so
+xrd.port $ORIGIN_PORT
+xrd.protocol http:$ORIGIN_PORT libXrdHttp.so
 
 xrd.tls $CA_DIR/tls.crt $CA_DIR/tls.key
 xrd.tlsca certfile $CA_DIR/tlsca.pem
@@ -306,7 +335,7 @@ $( [ "${XRDCL_CACHE_CONTROL:-0}" = "1" ] && printf '%s\n' \
 
 xrootd.fslib ++ throttle
 
-pss.origin https://localhost:8443
+pss.origin https://localhost:$ORIGIN_PORT
 oss.localroot $XROOTD_CACHEDIR/namespace
 pfc.spaces data meta
 oss.space data $XROOTD_CACHEDIR/data
@@ -335,10 +364,10 @@ EOF
 cat > "$RUNDIR/scitokens.cfg" << EOF
 
 [Global]
-audience = https://localhost:8443
+audience = https://localhost:$ORIGIN_PORT
 
 [Issuer Localhost]
-issuer = https://localhost:8443
+issuer = https://localhost:$ORIGIN_PORT
 base_path = /test
 
 EOF
@@ -499,11 +528,20 @@ echo > "$BINARY_DIR/tests/$TEST_NAME/cache-tight.log"
 # before Factory::Init reads them, so set them inline for this
 # xrootd invocation only.  See src/XrdClCurl/XrdClCurlFactory.cc
 # for the corresponding env var names.
+#
+# XRD_CURLNUMTHREADS + XRD_CURLMAXOPSPERWORKER shrink the effective
+# worker pool to 4 (1 thread * 4 ops); the caps below are percentages
+# of that pool, so 25% resolves to a single-slot starving cap and a
+# single-slot active cap.  With PendingBuffer=1 the second admit
+# fills the FIFO and every subsequent concurrent admit gets shed
+# with errRetry — the property the burst test asserts.
 XRD_CURLPENDINGBUFFER=1 \
 XRD_CURLPENDINGPERORIGIN=1 \
 XRD_CURLSTARVINGPERCENT=25 \
 XRD_CURLACTIVEPERCENT=25 \
 XRD_CURLEMASECONDS=5 \
+XRD_CURLNUMTHREADS=1 \
+XRD_CURLMAXOPSPERWORKER=4 \
   "$BINDIR/xrootd" -n cache-tight -c "$TIGHT_CACHE_CONFIG" 0<&- \
     >"$BINARY_DIR/tests/$TEST_NAME/cache-tight.log" 2>&1 &
 TIGHT_CACHE_PID=$!
@@ -534,7 +572,7 @@ echo "Tight-scheduler cache started at port $TIGHT_CACHE_PORT"
 
 if ! "$BINARY_DIR/tests/XrdClCurl/xrdscitokens-create-token" \
     issuer_public.pem issuer_private.pem test_key \
-    https://localhost:8443 storage.read:/ 600 > "$RUNDIR/token"; then
+    "https://localhost:$ORIGIN_PORT" storage.read:/ 600 > "$RUNDIR/token"; then
   echo "Failed to generate read token"
   exit 1
 fi
@@ -542,7 +580,7 @@ echo "Sample read token available at $RUNDIR/token"
 
 if ! "$BINARY_DIR/tests/XrdClCurl/xrdscitokens-create-token" \
     issuer_public.pem issuer_private.pem test_key \
-    https://localhost:8443 storage.modify:/ 600 > "$RUNDIR/write.token"; then
+    "https://localhost:$ORIGIN_PORT" storage.modify:/ 600 > "$RUNDIR/write.token"; then
   echo "Failed to generate write token"
   exit 1
 fi
