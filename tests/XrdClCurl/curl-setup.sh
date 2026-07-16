@@ -462,6 +462,76 @@ while [ -z "$CACHE_PORT" ]; do
 done
 echo "Cache started at port $CACHE_PORT"
 
+# Launch a second cache instance with the TagScheduler tightened
+# down as far as it goes so a concurrent burst of cache-miss GETs
+# is guaranteed to trigger scheduler rejections. Sharing the same
+# origin as the primary cache; the secondary lives in its own dir
+# so PFC state doesn't collide.
+XROOTD_TIGHTCACHEDIR=$RUNDIR/cache-tight
+rm -rf "$XROOTD_TIGHTCACHEDIR"
+mkdir -p "$XROOTD_TIGHTCACHEDIR"/namespace \
+         "$XROOTD_TIGHTCACHEDIR"/data \
+         "$XROOTD_TIGHTCACHEDIR"/meta || exit 1
+mkdir -p "$XROOTD_RUNDIR/cache-tight" || exit 1
+
+export TIGHT_CACHE_CONFIG="$XROOTD_CONFIGDIR/xrootd-cache-tight.conf"
+# Re-use every knob from the main cache config; only the admin /
+# storage paths change (so pids and the local namespace don't
+# collide with the primary cache) and the authdb is swapped for
+# one that permits anonymous reads on /test-public — this test only
+# cares about the scheduler's shed behaviour, not about auth.  See
+# SchedulerBurstTest.cc.
+cat > "$RUNDIR/authdb-tight" <<'EOF'
+
+u * /test-public lr
+
+EOF
+sed \
+  -e "s|$XROOTD_RUNDIR/cache|$XROOTD_RUNDIR/cache-tight|g" \
+  -e "s|$XROOTD_CACHEDIR/namespace|$XROOTD_TIGHTCACHEDIR/namespace|g" \
+  -e "s|$XROOTD_CACHEDIR/data|$XROOTD_TIGHTCACHEDIR/data|g" \
+  -e "s|$XROOTD_CACHEDIR/meta|$XROOTD_TIGHTCACHEDIR/meta|g" \
+  -e "s|$RUNDIR/authdb|$RUNDIR/authdb-tight|g" \
+  "$CACHE_CONFIG" > "$TIGHT_CACHE_CONFIG"
+
+echo > "$BINARY_DIR/tests/$TEST_NAME/cache-tight.log"
+# The scheduler env vars must be present in the cache process
+# before Factory::Init reads them, so set them inline for this
+# xrootd invocation only.  See src/XrdClCurl/XrdClCurlFactory.cc
+# for the corresponding env var names.
+XRD_CURLPENDINGBUFFER=1 \
+XRD_CURLPENDINGPERORIGIN=1 \
+XRD_CURLSTARVINGPERCENT=25 \
+XRD_CURLACTIVEPERCENT=25 \
+XRD_CURLEMASECONDS=5 \
+  "$BINDIR/xrootd" -n cache-tight -c "$TIGHT_CACHE_CONFIG" 0<&- \
+    >"$BINARY_DIR/tests/$TEST_NAME/cache-tight.log" 2>&1 &
+TIGHT_CACHE_PID=$!
+echo "Tight-scheduler cache PID: $TIGHT_CACHE_PID"
+echo "Tight-scheduler cache logs are at $BINARY_DIR/tests/$TEST_NAME/cache-tight.log"
+
+TIGHT_CACHE_PORT=$(grep -E -a '\-\-\-\-\-\- xrootd cache-tight@.*:[0-9]+ initialization completed' "$BINARY_DIR/tests/$TEST_NAME/cache-tight.log" | tr ':' ' ' | awk '{print $4}')
+IDX=0
+while [ -z "$TIGHT_CACHE_PORT" ]; do
+  sleep 1
+  TIGHT_CACHE_PORT=$(grep -E -a '\-\-\-\-\-\- xrootd cache-tight@.*:[0-9]+ initialization completed' "$BINARY_DIR/tests/$TEST_NAME/cache-tight.log" | tr ':' ' ' | awk '{print $4}')
+  IDX=$((IDX+1))
+  if [ $IDX -gt 1 ]; then
+    echo "Waiting for tight-scheduler cache to start ($IDX seconds so far) ..."
+  fi
+  if ! kill -0 "$TIGHT_CACHE_PID" 2>/dev/null; then
+    cat "$BINARY_DIR/tests/$TEST_NAME/cache-tight.log"
+    echo "Tight-scheduler cache process crashed - failing"
+    exit 1
+  fi
+  if [ $IDX -eq 50 ]; then
+    cat "$BINARY_DIR/tests/$TEST_NAME/cache-tight.log"
+    echo "Tight-scheduler cache failed to start - failing"
+    exit 1
+  fi
+done
+echo "Tight-scheduler cache started at port $TIGHT_CACHE_PORT"
+
 if ! "$BINARY_DIR/tests/XrdClCurl/xrdscitokens-create-token" \
     issuer_public.pem issuer_private.pem test_key \
     https://localhost:8443 storage.read:/ 600 > "$RUNDIR/token"; then
@@ -484,8 +554,10 @@ cat "$RUNDIR/token" >> "$RUNDIR/authz_header"
 cat > "$BINARY_DIR/tests/$TEST_NAME/setup.sh" <<EOF
 CACHE_PID=$CACHE_PID
 ORIGIN_PID=$ORIGIN_PID
+TIGHT_CACHE_PID=$TIGHT_CACHE_PID
 ORIGIN_URL=https://localhost:$ORIGIN_PORT
 CACHE_URL=https://localhost:$CACHE_PORT
+TIGHT_CACHE_URL=https://localhost:$TIGHT_CACHE_PORT
 HEADER_FILE=$RUNDIR/authz_header
 X509_CA_FILE=$CA_DIR/tlsca.pem
 PUBLIC_TEST_FILE=$PELICAN_PUBLIC_EXPORTDIR/hello_world-1mb.txt

@@ -39,8 +39,15 @@ fi
 
 if ! kill -0 "$CACHE_PID" 2>/dev/null; then
   echo "Cache process was already shut down by time the tear down was started"
-  exit
-else 
+else
   kill "$CACHE_PID"
+fi
+
+# Optional: tight-scheduler cache used by SchedulerBurstTest. Older
+# setup.sh files that predate that test may not export this.
+if [ -n "$TIGHT_CACHE_PID" ]; then
+  if kill -0 "$TIGHT_CACHE_PID" 2>/dev/null; then
+    kill "$TIGHT_CACHE_PID"
+  fi
 fi
 
