@@ -549,6 +549,17 @@ protected:
     // Whether the stat must use a plain HEAD (no PROPFIND / OPTIONS negotiation).
     bool m_force_head{false};
 
+    // Fall back to a plain HEAD.  Clears CUSTOMREQUEST, which libcurl keeps set
+    // on the handle: a leg that chose PROPFIND otherwise leaves the handle
+    // issuing PROPFIND even once m_is_propfind is false.
+    void SetHeadVerb();
+
+    // Whether the stat request is made using the PROPFIND verb.
+    bool m_is_propfind{false};
+    // Whether the stat response indicated that the object is a directory.
+    bool m_is_dir{false};
+    std::string m_response; // Body of the response (if using PROPFIND)
+
     // Mark the operation as a success and, as requested, return the stat info back
     // to the object handler.
     //
@@ -565,11 +576,7 @@ private:
 
     // Whether the response info variant of the info object should be sent
     bool m_response_info{false};
-    // Whether the stat request is made using the PROPFIND verb.
-    bool m_is_propfind{false};
-    // Whether the stat response indicated that the object is a directory.
-    bool m_is_dir{false};
-    std::string m_response; // Body of the response (if using PROPFIND)
+
     int64_t m_length{-1}; // Length of the object from the response
 };
 
