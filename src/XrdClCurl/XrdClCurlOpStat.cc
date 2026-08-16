@@ -42,8 +42,7 @@ CurlStatOp::OptionsDone()
         m_headers_list.emplace_back("Depth", "0");
         m_is_propfind = true;
     } else {
-        m_is_propfind = false;
-        curl_easy_setopt(m_curl.get(), CURLOPT_NOBODY, 1L);
+        SetHeadVerb();
     }
 }
 
@@ -57,8 +56,7 @@ CurlStatOp::Redirect(std::string &target)
     }
     if (m_force_head) {
         // Keep using a plain HEAD across redirects.
-        m_is_propfind = false;
-        curl_easy_setopt(m_curl.get(), CURLOPT_NOBODY, 1L);
+        SetHeadVerb();
         return CurlOperation::RedirectAction::Reinvoke;
     }
     auto &instance = VerbsCache::Instance();
@@ -74,8 +72,7 @@ CurlStatOp::Redirect(std::string &target)
         m_headers_list.emplace_back("Depth", "0");
         m_is_propfind = true;
     } else {
-        m_is_propfind = false;
-        curl_easy_setopt(m_curl.get(), CURLOPT_NOBODY, 1L);
+        SetHeadVerb();
     }
     return CurlOperation::RedirectAction::Reinvoke;
 }
@@ -88,8 +85,7 @@ CurlStatOp::Setup(CURL *curl, CurlWorker &worker)
     curl_easy_setopt(m_curl.get(), CURLOPT_WRITEDATA, this);
 
     if (m_force_head) {
-        m_is_propfind = false;
-        curl_easy_setopt(m_curl.get(), CURLOPT_NOBODY, 1L);
+        SetHeadVerb();
         return true;
     }
 
@@ -101,9 +97,25 @@ CurlStatOp::Setup(CURL *curl, CurlWorker &worker)
         m_headers_list.emplace_back("Depth", "0");
         m_is_propfind = true;
     } else {
-        curl_easy_setopt(m_curl.get(), CURLOPT_NOBODY, 1L);
+        SetHeadVerb();
     }
     return true;
+}
+
+// SetHeadVerb falls the operation back to a plain HEAD.
+//
+// Clearing CUSTOMREQUEST is the point: libcurl keeps it set on the easy
+// handle, so a leg that had chosen PROPFIND leaves the handle issuing
+// PROPFIND even after m_is_propfind is cleared. GetStatInfo() then reads the
+// object's size from the Content-Length of the multistatus response -- the
+// size of the XML document, not of the object -- and the caller caches a
+// truncated file.
+void
+CurlStatOp::SetHeadVerb()
+{
+    m_is_propfind = false;
+    curl_easy_setopt(m_curl.get(), CURLOPT_CUSTOMREQUEST, nullptr);
+    curl_easy_setopt(m_curl.get(), CURLOPT_NOBODY, 1L);
 }
 
 void
@@ -111,9 +123,11 @@ CurlStatOp::ReleaseHandle()
 {
     if (m_curl == nullptr) return;
     curl_easy_setopt(m_curl.get(), CURLOPT_NOBODY, 0L);
-    if (m_is_propfind) {
-        curl_easy_setopt(m_curl.get(), CURLOPT_CUSTOMREQUEST, nullptr);
-    }
+    // Unconditionally: m_is_propfind may have been cleared by a redirect that
+    // fell back to HEAD, while CUSTOMREQUEST was left set from an earlier leg.
+    // Handing such a handle back to the pool makes the next operation to use
+    // it -- a GET, say -- issue a PROPFIND instead.
+    curl_easy_setopt(m_curl.get(), CURLOPT_CUSTOMREQUEST, nullptr);
     curl_easy_setopt(m_curl.get(), CURLOPT_WRITEFUNCTION, nullptr);
     curl_easy_setopt(m_curl.get(), CURLOPT_WRITEDATA, nullptr);
     CurlOperation::ReleaseHandle();
@@ -159,8 +173,19 @@ CurlStatOp::ParseProp(tinyxml2::XMLElement *prop) {
 std::pair<int64_t, bool>
 CurlStatOp::GetStatInfo() {
     if (!m_is_propfind) {
-        m_length = m_headers.GetContentLength();
-        return {m_length, false};
+        // A 207 says the server answered a PROPFIND even though this leg
+        // believed it had issued a HEAD -- a CUSTOMREQUEST left on the handle
+        // by an earlier leg does exactly that. The Content-Length then
+        // describes the multistatus document, not the object, and taking it
+        // silently hands the caller a truncated file. Parse the body instead.
+        if (m_headers.GetStatusCode() == 207) {
+            m_logger->Warning(kLogXrdClCurl, "Stat of %s expected a HEAD reply but got a 207 multistatus; "
+                "parsing the response body for the object size", m_url.c_str());
+            m_is_propfind = true;
+        } else {
+            m_length = m_headers.GetContentLength();
+            return {m_length, false};
+        }
     }
     if (m_length >= 0) {
         return {m_length, m_is_dir};

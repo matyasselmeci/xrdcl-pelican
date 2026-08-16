@@ -38,6 +38,7 @@ add_executable( xrdcl-curl-unit
   ErrnoConvertTest.cc
   ErrorMessageTest.cc
   RedirectTest.cc
+  StatVerbTest.cc
   TagSchedulerTest.cc
 )
 
