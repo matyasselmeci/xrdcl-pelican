@@ -1,6 +1,6 @@
 
 Name: xrdcl-pelican
-Version: 1.8.0
+Version: 1.8.1
 Release: 1%{?dist}
 Summary: A Pelican-specific backend for the XRootD client
 
@@ -106,6 +106,9 @@ make install DESTDIR=$RPM_BUILD_ROOT
 %endif
 
 %changelog
+* Mon Aug 24 2026 Mátyás Selmeci <mselmeci@wisc.edu> 1.8.1-1
+- Fix misreported object size leading to data truncation.
+
 * Thu Jul 16 2026 Brian Bockelman <bbockelman@morgridge.org> 1.8.0-1
 - Add a per-origin fair scheduler in front of the curl worker pool so
   that a single unresponsive upstream origin cannot hold every worker
