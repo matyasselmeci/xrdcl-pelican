@@ -41,6 +41,7 @@ TagScheduler::TagScheduler(unsigned worker_count, const Config &cfg, XrdCl::Log 
   , m_last_tick(std::chrono::steady_clock::now())
   , m_rng(std::random_device{}())
 {
+    m_life->self = this;
     if (m_logger) {
         m_logger->Debug(kLogXrdClCurl,
             "TagScheduler: worker_count=%u starving_cap=%d active_cap=%d "
@@ -53,6 +54,12 @@ TagScheduler::TagScheduler(unsigned worker_count, const Config &cfg, XrdCl::Log 
 
 TagScheduler::~TagScheduler()
 {
+    // Stop the completion hooks from dispatching into this scheduler before
+    // we tear anything down.
+    {
+        std::lock_guard<std::mutex> life_lock(m_life->mu);
+        m_life->self = nullptr;
+    }
     Shutdown();
 }
 
@@ -125,14 +132,17 @@ bool TagScheduler::Admit(std::string tag, std::shared_ptr<CurlOperation> op)
     // starving bucket, without cross-file coupling to CurlOperation
     // internals.
     auto first_byte = std::make_shared<std::atomic<bool>>(false);
-    op->m_on_first_byte = [this, tag, first_byte]() {
+    auto live = m_life;
+    op->m_on_first_byte = [live, tag, first_byte]() {
         if (!first_byte->exchange(true, std::memory_order_relaxed)) {
-            this->OnFirstByte(tag);
+            std::lock_guard<std::mutex> life_lock(live->mu);
+            if (live->self) live->self->OnFirstByte(tag);
         }
     };
-    op->m_on_done = [this, tag, first_byte]() {
+    op->m_on_done = [live, tag, first_byte]() {
         bool still_starving = !first_byte->load(std::memory_order_relaxed);
-        this->OnDone(tag, still_starving);
+        std::lock_guard<std::mutex> life_lock(live->mu);
+        if (live->self) live->self->OnDone(tag, still_starving);
     };
 
     state.pending.emplace_back(std::move(op));
