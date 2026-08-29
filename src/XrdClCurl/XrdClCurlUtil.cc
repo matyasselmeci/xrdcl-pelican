@@ -977,9 +977,12 @@ HandlerQueue::Produce(std::shared_ptr<CurlOperation> handler)
     // during wait), fail the operation directly so callers that
     // haven't been ported to TryProduce still see a clean error
     // path instead of a lost request.
-    auto raw = handler.get();
+    //
+    // keepalive keeps the shared_ptr use count from dropping to zero
+    // when TryProduce() moves and then releases the handler.
+    auto keepalive = handler;
     if (!TryProduce(std::move(handler))) {
-        raw->Fail(XrdCl::errRetry, 0,
+        keepalive->Fail(XrdCl::errRetry, 0,
             "Too many pending requests for this origin; try again later");
     }
 }
