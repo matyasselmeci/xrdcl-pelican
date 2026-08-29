@@ -185,6 +185,16 @@ private:
     // by PickTag_locked. Refreshed every monitor tick.
     EmaMap m_ema_snapshot;
 
+    // Liveness handle shared with the per-op completion hooks. A hook holds
+    // m_life->mu while calling OnFirstByte/OnDone; the destructor clears
+    // m_life->self under the same mutex first, so a hook can never dispatch
+    // into a destroyed scheduler.
+    struct Liveness {
+        std::mutex    mu;
+        TagScheduler *self = nullptr;
+    };
+    std::shared_ptr<Liveness> m_life{std::make_shared<Liveness>()};
+
     // Convert a percentage of m_worker_count into an absolute cap,
     // with a floor of 1 so tiny worker pools always dispatch
     // something. 0 / ≥100 percent map to "no cap" (== m_worker_count).
