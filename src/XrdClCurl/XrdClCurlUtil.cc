@@ -1646,6 +1646,9 @@ CurlWorker::Run() {
                     break;
                 }
                 auto op = iter->second.first;
+                // Stable key: m_op_map may be inserted into below, which can
+                // rehash and invalidate iter.
+                CURL *const easy_handle = msg->easy_handle;
                 auto res = msg->data.result;
                 bool keep_handle = false;
                 bool waiting_on_callout = false;
@@ -1682,7 +1685,7 @@ CurlWorker::Run() {
                             }
                         }
                         // The curl operation was successful, it's just the HTTP request failed; recycle the handle.
-                        queue.RecycleHandle(iter->first);
+                        queue.RecycleHandle(easy_handle);
                     } else {
                         CurlOptionsOp *options_op = nullptr;
                         // If this was a successful OPTIONS op, invoke the parent operation.
@@ -1694,8 +1697,8 @@ CurlWorker::Run() {
                             op->OptionsDone();
                             OpRecord(*op, OpKind::Start);
                             curl_multi_add_handle(multi_handle, options_op->GetParentCurlHandle());
-                            curl_multi_remove_handle(multi_handle, iter->first);
-                            queue.RecycleHandle(iter->first);
+                            curl_multi_remove_handle(multi_handle, easy_handle);
+                            queue.RecycleHandle(easy_handle);
                         }
                         // Check to see if the operation ended in a redirect (note: this might)
                         // be invoked a second time if this was the parent operation of an OPTIONS
@@ -1732,7 +1735,7 @@ CurlWorker::Run() {
                                     // operation.
                                     std::string modified_url;
                                     target = VerbsCache::GetUrlKey(target, modified_url);
-                                    options_op = new CurlOptionsOp(iter->first, op, target, m_logger, op->GetConnCalloutFunc());
+                                    options_op = new CurlOptionsOp(easy_handle, op, target, m_logger, op->GetConnCalloutFunc());
                                     std::shared_ptr<CurlOperation> new_op(options_op);
                                     auto curl = queue.GetHandle();
                                     if (curl == nullptr) {
@@ -1779,7 +1782,7 @@ CurlWorker::Run() {
                             if ((waiting_on_callout = callout_socket >= 0)) {
                                 auto expiry = time(nullptr) + 20;
                                 m_logger->Debug(kLogXrdClCurl, "Creating a callout wait request on socket %d", callout_socket);
-                                broker_reqs[callout_socket] = {iter->first, expiry};
+                                broker_reqs[callout_socket] = {easy_handle, expiry};
                                 m_conncall_req.fetch_add(1, std::memory_order_relaxed);
                             }
                         } else if (options_op) {
@@ -1787,15 +1790,15 @@ CurlWorker::Run() {
                             curl_multi_add_handle(multi_handle, options_op->GetParentCurlHandle());
                         }
                         if (keep_handle) {
-                            curl_multi_remove_handle(multi_handle, iter->first);
+                            curl_multi_remove_handle(multi_handle, easy_handle);
                             if (!waiting_on_callout && !options_op) {
-                                curl_multi_add_handle(multi_handle, iter->first);
+                                curl_multi_add_handle(multi_handle, easy_handle);
                             }
                         } else if (!options_op) {
                             op->Success();
                             op->ReleaseHandle();
                             // If the handle was successful, then we can recycle it.
-                            queue.RecycleHandle(iter->first);
+                            queue.RecycleHandle(easy_handle);
                         }
                     }
                 } else if (res == CURLE_COULDNT_CONNECT && op->UseConnectionCallout() && !op->GetTriedBoker()) {
@@ -1810,10 +1813,10 @@ CurlWorker::Run() {
                         op->ReleaseHandle();
                         keep_handle = false;
                     } else {
-                        curl_multi_remove_handle(multi_handle, iter->first);
+                        curl_multi_remove_handle(multi_handle, easy_handle);
                         auto expiry = time(nullptr) + 20;
                         m_logger->Debug(kLogXrdClCurl, "Curl operation requires a new TCP socket; waiting for callout to respond on socket %d", wait_socket);
-                        broker_reqs[wait_socket] = {iter->first, expiry};
+                        broker_reqs[wait_socket] = {easy_handle, expiry};
                         m_conncall_req.fetch_add(1, std::memory_order_relaxed);
                     }
                 } else {
@@ -1937,12 +1940,12 @@ CurlWorker::Run() {
                     op->ReleaseHandle();
                 }
                 if (!keep_handle) {
-                    curl_multi_remove_handle(multi_handle, iter->first);
+                    curl_multi_remove_handle(multi_handle, easy_handle);
                     if (res != CURLE_OK) {
-                        curl_easy_cleanup(iter->first);
+                        curl_easy_cleanup(easy_handle);
                     }
                     for (auto &req : broker_reqs) {
-                        if (req.second.curl == iter->first) {
+                        if (req.second.curl == easy_handle) {
                             m_logger->Warning(kLogXrdClCurl, "Curl handle finished while a broker operation was outstanding");
                             m_conncall_errors.fetch_add(1, std::memory_order_relaxed);
                         }
